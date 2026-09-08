@@ -1,0 +1,96 @@
+Subject: 【HDR 消除 · 台式机内容引擎配置指南】RTX 4070 Ti Super 本地跑 ComfyUI + SD-Inpaint
+
+Hi,
+
+这是给你那台 RTX 4070 Ti Super 台式机的配置指南，目标是把 HDR 物体消除的「内容生成」层跑在本地：
+用 OpenClaw 远程操作，ComfyUI 作为常驻服务，SD-Inpaint（或 LaMa）做真实的内容消除，M4/浏览器通过
+ComfyUI 的 /prompt API 调用。这样零云成本、mask 精确、无冷启动。
+
+============================================================
+0）我们要搭的是什么
+============================================================
+  seg_ui(lasso→SAM 出 mask) ─┐
+                            ├─> inpaint_sdr(sdr, mask)  <- 这一层由台式机本地 ComfyUI 承担
+  hdr_ai_erase.py  ----──────┘
+  本地 gainmap Poisson + 重建 HDR + libultrahdr 编码  <- 仍在本机，不需要 GPU
+也就是：内容生成（需要算力）放台式机，HDR/gainmap 逻辑留本机。
+
+============================================================
+1）前置检查（一劳永逸，先确认）
+============================================================
+  · 显卡：RTX 4070 Ti Super（16GB VRAM）
+  · 驱动：NVIDIA 驱动 >= 535（Windows） / 对应 CUDA（Linux）
+  · Python：>= 3.10，推荐 3.11/3.12（单独 venv，别用系统 python）
+  · 确认 GPU 可用：nvidia-smi 能看到 4070 TiS 即可
+
+============================================================
+2）装 ComfyUI（官方版）
+============================================================
+  git clone https://github.com/comfyanonymous/ComfyUI.git
+  cd ComfyUI
+  python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+  pip install -r requirements.txt
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    # 若你的 CUDA 是 12.8，换成 cu128；Linux 同例
+
+============================================================
+3）装内容模型（二选一，先用轻的）
+============================================================
+  推荐先跑 SD 1.5 Inpaint（小、快、够用）；求质再用 SDXL Inpaint。
+  把下载好的模型放进 ComfyUI/models/checkpoints/：
+    · sd-v1-5-inpainting.safetensors        (~2GB)
+    · sd_xl_base_1.0_inpainting.safetensors (~6.5GB)  # 可选，更细腻
+  (也可以在 ComfyUI 里用节点直接下载，或从 civitai/HuggingFace 拿 inpaint 版权重)
+
+  补：(可选) LaMa 做「大 mask 消除」更快，用自定义节点 ComfyUI-Impact-Pack 或
+       saic-mdal/lama 的 big-lama 权重；先用 SD1.5-Inpaint 验证，效果够了就够。
+
+============================================================
+4）启动 ComfyUI（常驻服务，★安全绑定 127.0.0.1★）
+============================================================
+  source venv/bin/activate
+  python main.py --listen 127.0.0.1 --port 8188 --lowvram
+    # 绑定 127.0.0.1 = 只监听本机，不暴露局域网/公网。（ComfyUI 默认无鉴权，节点可执行代码，
+    #   所以绝不能 --listen 0.0.0.0 裸暴露；配合下方 Tailscale 远程访问才是安全方案。）
+    # --lowvram 保守省显存；4070 TiS 16G 其实可以不开 lowvram。
+    后台常驻：nohup python main.py --listen 127.0.0.1 --port 8188 > comfy.log 2>&1 &
+
+  验证：浏览器 http://localhost:8188 能打开 ComfyUI 界面即成功。
+  API：POST http://localhost:8188/prompt 提交工作流，GET /history 取结果。
+
+============================================================
+5）让 M4 访问（免费方案，★不暴露公网★）
+============================================================
+  · 两台设备装 Tailscale（免费）→ 加入同一加密虚拟局域网（WireGuard）。
+  · 推荐用 Tailscale 的服务代理，把「本机 127.0.0.1:8188」安全地暴露给 tailnet 内设备：
+      台式机：tailscale serve --bg 8188
+      M4 访问：http://<台式机Tailscale 主机名>.ts.net:8188   （走加密通道，不开放公网端口）
+  · 或 SSH 端口转发（加密 + 密钥认证）：
+      M4：ssh -L 8188:localhost:8188 user@<台式机TailscaleIP>
+  · 之后 seg_ui/hdr_ai_erase 把 inpaint_sdr() 指向 http://<台式机>:8188/prompt 即可。
+  · 安全要点：ComfyUI 永远绑 127.0.0.1；路由器关掉 UPnP；防火墙 8188 只放行 tailnet；
+    只用信任的自定义节点（节点会执行代码）；系统/依赖保持更新。
+  · 不必买付费远程桌面：ComfyUI 是网页服务，浏览器即可，OpenClaw 负责一次性安装/启动。
+
+============================================================
+6）接回我们已有的流程（内容引擎切换）
+============================================================
+  现有代码已经预留好「内容生成」这一个可插拔函数 inpaint_sdr(sdr, mask)。
+  你只要把这个函数实现成「POST 台式机 ComfyUI /prompt，传 image+mask，轮询取回 erased SDR」，
+  其余 gainmap Poisson / 重建 HDR / 编码 保持不变。
+  等接好后，seg_ui 里「内容引擎」选本地 ComfyUI 即可。
+
+============================================================
+7）建议 & 常见坑
+============================================================
+  · 模型分辨率：SD-Inpaint 在 512/1024 上跑，你 2464x3280 的大图要在工作流里
+    「缩到工作尺寸 → 修 → 放大回」，ComfyUI 原生支持（或用 Impact-Pack 自动放回）。
+  · 显存：SD1.5-Inpaint 很轻松；SDXL-Inpaint 16GB 也带得动；多 ControlNet/LoRA 同时上会紧。
+  · mask 语义：进 ComfyUI 前确认 mask 是「白=要修的区域、黑=保留」。
+  · 若要 M4 直接调台式机：优先 Tailscale 打通网络，代码里改成 ComfyUI 地址即可。
+  · 已写好的后端 /erase 在 seg_ui/backend/app.py，可参考它的出/入参做本地 ComfyUI 适配。
+
+============================================================
+需要我接着往下做的：把这台台式机真正跑起来的逐条命令、或者把
+inpaint_sdr() 写成「调本地 ComfyUI /prompt」的版本，随时说。
+============================================================

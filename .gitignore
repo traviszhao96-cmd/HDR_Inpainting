@@ -1,0 +1,53 @@
+# ============================================================
+# 凭据 / 密钥 —— 严禁提交（泄漏防护优先）
+# ============================================================
+.qq_smtp.env
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+*.secret
+*token*
+
+# ============================================================
+# 大体积 / 生成产物 —— 不要提交
+# ============================================================
+/output/
+/build/
+__pycache__/
+*.pyc
+*.pyo
+*.raw              # 原始管线产物（单个约 32MB）
+out.jpeg
+outrgb.raw
+.DS_Store
+.ds_store
+*.log
+*.tmp
+
+# ============================================================
+# 嵌套仓库（独立的上游 git，不在本项目内维护）
+# ============================================================
+/libultrahdr/
+
+# ============================================================
+# 平台相关编译产物 / 前端依赖（seg_ui 另有自己的 .gitignore）
+# ============================================================
+/tools/extract_rgb_from_raw
+/tools/extract_rgb_from_raw_debug
+/tools/raw_processor
+/tools/jpg_to_rgba_tif
+/seg_ui/node_modules/
+/seg_ui/.venv/
+/seg_ui/.next/
+/seg_ui/.vinext/
+/seg_ui/dist/
+# 后端 /erase 测试产物（.raw/.jpg/.png，数百 MB）
+/seg_ui/results/
+# 未引用的示例图，排除
+/seg_ui/public/sample-building.jpg
