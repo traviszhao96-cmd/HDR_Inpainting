@@ -5,14 +5,19 @@
 .env
 .env.*
 *.env
+*.env.*
+!*.env.example
 *.pem
 *.key
 *.p12
 *.pfx
 id_rsa
 id_rsa.pub
-*.secret
+.secret
 *token*
+# 本机 SSH 密钥（用于远程控制 openbayes 实例，勿提交）
+.ssh_ultrahdr_key
+.ssh_ultrahdr_key.pub
 
 # ============================================================
 # 大体积 / 生成产物 —— 不要提交
@@ -49,5 +54,10 @@ outrgb.raw
 /seg_ui/dist/
 # 后端 /erase 测试产物（.raw/.jpg/.png，数百 MB）
 /seg_ui/results/
+/seg_ui/test_images/*
+!/seg_ui/test_images/README.md
+/seg_ui/test_masks/
+/seg_ui/test_runs/
+*.tsbuildinfo
 # 未引用的示例图，排除
 /seg_ui/public/sample-building.jpg

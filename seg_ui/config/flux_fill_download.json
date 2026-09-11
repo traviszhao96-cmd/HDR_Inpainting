@@ -1,0 +1,16 @@
+{
+  "model": "FLUX.1 Fill [dev]",
+  "quantization": "Q4_K_S",
+  "publisher": "YarvixPA",
+  "repository": "YarvixPA/FLUX.1-Fill-dev-GGUF",
+  "revision": "78b83f1da140a4dcd6466580516544e1f6effe3e",
+  "filename": "flux1-fill-dev-Q4_K_S.gguf",
+  "size_bytes": 6809920800,
+  "sha256": "3782c22eda0622d50eb8683d2aa664e8534a8c1e29ce9e91df491cc400944dc8",
+  "source": "https://huggingface.co/YarvixPA/FLUX.1-Fill-dev-GGUF/resolve/78b83f1da140a4dcd6466580516544e1f6effe3e/flux1-fill-dev-Q4_K_S.gguf",
+  "windows_destination": "C:\\Users\\Administrator\\ComfyUI\\models\\unet\\flux1-fill-dev-Q4_K_S.gguf",
+  "loader": "city96/ComfyUI-GGUF (not installed at preflight)",
+  "license": "flux-1-dev-non-commercial-license; upstream terms remain applicable",
+  "purpose": "Dedicated inpainting evaluation; not yet integrated or inference-tested",
+  "integrity_requirement": "Keep .part extension until exact size and SHA256 both match"
+}
