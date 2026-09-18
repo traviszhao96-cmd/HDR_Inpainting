@@ -11,6 +11,8 @@ import sys
 import threading
 import time
 import uuid
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -23,6 +25,9 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image
 from transformers import Sam2Model, Sam2Processor
 from .mask_ops import refine_mask
+from .sdr_prompt import removal_prompt
+from .run_mask_probe import fill_graph
+from .sdr_composite import composite_sdr
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
@@ -87,6 +92,53 @@ def get_model() -> tuple[Sam2Model, Sam2Processor]:
 
 
 app = FastAPI(title="HDR Mask Lab", version="0.1.0")
+PORTFOLIO_DIR = ROOT_DIR / 'seg_ui/portfolio'
+
+
+@app.get('/portfolio')
+def portfolio_list():
+    items = []
+    for path in sorted(PORTFOLIO_DIR.glob('*/work.json'), key=lambda p: p.stat().st_mtime, reverse=True):
+        items.append(json.loads(path.read_text()))
+    return {'items': items, 'directory': str(PORTFOLIO_DIR)}
+
+
+@app.post('/portfolio')
+def portfolio_save(job_id: str = Form(...)):
+    if len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id):
+        raise HTTPException(400, '无效的作品编号')
+    source = RESULTS_DIR / job_id
+    artifact = source / 'erased_uhdr.jpg'
+    if not artifact.is_file():
+        artifact = source / 'erased_sdr.png'
+    preview = source / 'erased_sdr.png'
+    if not artifact.is_file() or not preview.is_file():
+        raise HTTPException(404, '消除结果不存在')
+    destination = PORTFOLIO_DIR / job_id
+    destination.mkdir(parents=True, exist_ok=True)
+    manifest = destination / 'work.json'
+    if manifest.exists():
+        return json.loads(manifest.read_text())
+    filename = 'work' + artifact.suffix
+    shutil.copy2(artifact, destination / filename)
+    shutil.copy2(preview, destination / 'preview.png')
+    item = {'id':job_id, 'name':time.strftime('作品 %Y-%m-%d %H:%M:%S'),
+            'kind':'Ultra HDR' if artifact.suffix == '.jpg' else 'SDR',
+            'url':f'/portfolio/{job_id}/{filename}',
+            'preview_url':f'/portfolio/{job_id}/preview.png',
+            'path':str(destination / filename)}
+    manifest.write_text(json.dumps(item, ensure_ascii=False, indent=2))
+    return item
+
+
+@app.get('/portfolio/{work_id}/{filename}')
+def portfolio_file(work_id: str, filename: str):
+    if len(work_id) != 32 or any(c not in '0123456789abcdef' for c in work_id) or filename not in {'work.jpg','work.png','preview.png'}:
+        raise HTTPException(404, '作品不存在')
+    path = PORTFOLIO_DIR / work_id / filename
+    if not path.is_file():
+        raise HTTPException(404, '作品不存在')
+    return FileResponse(path)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -225,6 +277,7 @@ def openai_downscaled_edit(
     model: str,
     cloud_input_path: Path,
 ):
+    prompt = removal_prompt(prompt)
     ys, xs = np.nonzero(mask)
     if not ys.size:
         raise HTTPException(status_code=400, detail="蒙版是空的，请重新圈选")
@@ -311,15 +364,7 @@ def opencv_erase(source: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 def composite_generated_crop(source: np.ndarray, generated: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Blend generated pixels under the mask with a narrow soft edge."""
-    mask_u8 = mask.astype(np.uint8) * 255
-    feathered = cv2.GaussianBlur(mask_u8, (0, 0), sigmaX=2.5, sigmaY=2.5).astype(np.float32) / 255.0
-    alpha = feathered[:, :, None]
-    return np.clip(
-        source.astype(np.float32) * (1.0 - alpha) + generated.astype(np.float32) * alpha,
-        0,
-        255,
-    ).astype(np.uint8)
+    return composite_sdr(source, generated, mask)
 
 
 def comfyui_downscaled_edit(
@@ -329,8 +374,14 @@ def comfyui_downscaled_edit(
     prompt: str,
     cloud_input_path: Path,
     engine_override: str | None = None,
+    seed: int | None = None,
+    steps: int = 20,
+    work_size: int | None = None,
+    gain_task: bool = False,
 ):
     """Run a masked local inpainting workflow on a remote ComfyUI server."""
+    edit_started = time.perf_counter()
+    prompt = prompt if gain_task else removal_prompt(prompt)
     if not COMFYUI_URL:
         raise HTTPException(status_code=400, detail="后台未设置 COMFYUI_URL")
     comfy_engine = (engine_override or COMFYUI_ENGINE).lower()
@@ -349,24 +400,35 @@ def comfyui_downscaled_edit(
     crop_mask = mask[y0:y1, x0:x1]
 
     crop_height, crop_width = crop_source.shape[:2]
-    scale = min(1.0, COMFYUI_WORK_SIZE / max(crop_width, crop_height))
+    scale = min(1.0, (work_size or COMFYUI_WORK_SIZE) / max(crop_width, crop_height))
     work_width = max(64, (round(crop_width * scale) // 8) * 8)
     work_height = max(64, (round(crop_height * scale) // 8) * 8)
     work_image = Image.fromarray(crop_source).resize((work_width, work_height), Image.Resampling.LANCZOS)
-    work_mask = Image.fromarray(crop_mask.astype(np.uint8) * 255).resize(
+    # Model and compositor use the same mask; no extra generation buffer.
+    generation_mask = crop_mask.copy()
+    work_mask = Image.fromarray(generation_mask.astype(np.uint8) * 255).resize(
         (work_width, work_height), Image.Resampling.NEAREST
     )
     work_image.save(cloud_input_path)
 
     request_id = uuid.uuid4().hex
-    image_name = f"hdr_erase_{request_id}.png"
+    generation_seed = int(request_id[:16], 16) if seed is None else seed
+    image_name = f"hdr_erase_{request_id}.webp"
     mask_name = f"hdr_erase_{request_id}_mask.png"
     session = requests.Session()
 
     def upload(name: str, image: Image.Image):
-        response = session.post(
+        payload = io.BytesIO()
+        if name.endswith('.webp'):
+            image.save(payload, format='WEBP', lossless=True, method=4)
+            mime = 'image/webp'
+        else:
+            image.save(payload, format='PNG', optimize=True)
+            mime = 'image/png'
+        # Separate sessions: requests.Session is not shared across worker threads.
+        response = requests.post(
             f"{COMFYUI_URL}/upload/image",
-            files={"image": (name, png_bytes(image), "image/png")},
+            files={"image": (name, payload.getvalue(), mime)},
             data={"type": "input", "overwrite": "true"},
             timeout=60,
         )
@@ -374,8 +436,13 @@ def comfyui_downscaled_edit(
         return response.json().get("name", name)
 
     try:
-        uploaded_image = upload(image_name, work_image)
-        uploaded_mask = upload(mask_name, work_mask)
+        upload_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as uploads:
+            image_future = uploads.submit(upload, image_name, work_image)
+            mask_future = uploads.submit(upload, mask_name, work_mask)
+            uploaded_image = image_future.result()
+            uploaded_mask = mask_future.result()
+        upload_seconds = time.perf_counter() - upload_started
         if comfy_engine == "lama":
             workflow = {
                 "2": {"class_type": "LoadImage", "inputs": {"image": uploaded_image}},
@@ -389,6 +456,12 @@ def comfyui_downscaled_edit(
             }
             output_node = "9"
             engine_name = COMFYUI_LAMA_MODEL
+        elif comfy_engine == "flux-fill":
+            workflow = fill_graph(uploaded_image, uploaded_mask, prompt,
+                                  generation_seed, f"hdr_erase/{request_id}", 1.0)
+            workflow['17']['inputs']['steps'] = steps
+            output_node = "19"
+            engine_name = "FLUX.1 Fill-dev Q4_K_S + ObjectRemovalFluxFill v2 (1.0)"
         elif comfy_engine in {"flux2", "flux2-klein", "flux2_klein"}:
             # FLUX.2 Klein is a reference-image editor rather than a classic
             # masked inpaint model.  The generated crop is therefore composited
@@ -488,6 +561,8 @@ def comfyui_downscaled_edit(
             }
             output_node = "9"
             engine_name = COMFYUI_CHECKPOINT
+        (cloud_input_path.parent / "sdr_workflow.json").write_text(json.dumps(workflow, indent=2))
+        inference_started = time.perf_counter()
         queued = session.post(
             f"{COMFYUI_URL}/prompt",
             json={"prompt": workflow, "client_id": request_id},
@@ -498,7 +573,12 @@ def comfyui_downscaled_edit(
         deadline = time.monotonic() + 240
         output_info = None
         while time.monotonic() < deadline:
-            history_response = session.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
+            try:
+                history_response = session.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
+            except (requests.Timeout, requests.ConnectionError):
+                # Retry only the read: the submitted GPU job may have completed.
+                time.sleep(1)
+                continue
             history_response.raise_for_status()
             history = history_response.json().get(prompt_id)
             if history:
@@ -512,6 +592,8 @@ def comfyui_downscaled_edit(
             time.sleep(1)
         if output_info is None:
             raise TimeoutError("ComfyUI 生成超时")
+        inference_seconds = time.perf_counter() - inference_started
+        download_started = time.perf_counter()
         generated_response = session.get(
             f"{COMFYUI_URL}/view",
             params={
@@ -523,21 +605,71 @@ def comfyui_downscaled_edit(
         )
         generated_response.raise_for_status()
         edited = Image.open(io.BytesIO(generated_response.content)).convert("RGB")
+        edited.save(cloud_input_path.parent / 'model_output.png')
+        download_seconds = time.perf_counter() - download_started
     except (requests.RequestException, KeyError, ValueError, OSError, RuntimeError, TimeoutError) as error:
         raise HTTPException(status_code=502, detail=f"ComfyUI 消除失败：{error}") from error
 
     generated = np.asarray(edited.resize((crop_width, crop_height), Image.Resampling.LANCZOS), dtype=np.uint8)
-    composited_crop = composite_generated_crop(crop_source, generated, crop_mask)
+    Image.fromarray(generated).save(cloud_input_path.parent / "sdr_generated_crop.png")
+    Image.fromarray(crop_mask.astype(np.uint8) * 255).save(cloud_input_path.parent / "sdr_composite_mask.png")
+    Image.fromarray(generation_mask.astype(np.uint8) * 255).save(cloud_input_path.parent / "sdr_generation_mask.png")
+    composited_crop = generated if gain_task else composite_generated_crop(crop_source, generated, crop_mask)
     result = source.copy()
     result[y0:y1, x0:x1] = composited_crop
     return result, {
         "backend": "comfyui",
         "engine": engine_name,
+        "steps": steps,
+        "timings_seconds": {"upload": upload_seconds, "queue_and_inference": inference_seconds,
+                            "download": download_seconds, "total": time.perf_counter()-edit_started},
         "roi": [x0, y0, x1, y1],
         "source_size": [crop_width, crop_height],
         "cloud_input_size": [work_width, work_height],
         "cloud_output_size": f"{work_width}x{work_height}",
     }
+
+
+def generate_gainmap(gain, mask, job_dir):
+    """Experimental Fill gain synthesis; scalar log gain, no ControlNet/buffer."""
+    from .run_gainmap_probe import GAIN_PROMPT, finish_gain
+    started = time.perf_counter()
+    if not mask.any():
+        return gain.copy()
+    if mask.all():
+        raise HTTPException(422, '生成式 Gainmap 需要蒙版外的已知区域')
+    log_gain = np.log2(np.maximum(gain, 1e-6))
+    low, high = float(log_gain.min()), float(log_gain.max())
+    if high-low < 1e-6:
+        return gain.copy()
+    preview = np.rint(np.clip((log_gain-low)/(high-low), 0, 1)*255).astype(np.uint8)
+    # Do not feed old object structure into the masked region.
+    preview[mask] = int(np.median(preview[~mask]))
+    directory = job_dir / 'gain_generation'
+    directory.mkdir(exist_ok=True)
+    _, info = comfyui_downscaled_edit(np.repeat(preview[..., None], 3, axis=2), mask,
+        prompt=GAIN_PROMPT, cloud_input_path=directory/'input.png',
+        engine_override='flux-fill', steps=8, work_size=576, gain_task=True)
+    x0,y0,x1,y1 = info['roi']
+    size = tuple(info['cloud_input_size'])
+    original = cv2.resize(log_gain[y0:y1,x0:x1], size, interpolation=cv2.INTER_AREA)
+    small_mask = cv2.resize(mask[y0:y1,x0:x1].astype(np.uint8), size,
+                           interpolation=cv2.INTER_NEAREST).astype(bool)
+    if not small_mask.any() or small_mask.all():
+        raise HTTPException(422, 'Gainmap 蒙版缩放后无有效边界，请调整选区')
+    raw = Image.open(directory/'model_output.png')
+    mixed = finish_gain(raw, original, small_mask, size, low, high, 0, 10)
+    if not np.isfinite(mixed).all():
+        raise HTTPException(500, '生成式 Gainmap 边界校正结果无效')
+    full = cv2.resize(mixed, (x1-x0,y1-y0), interpolation=cv2.INTER_LINEAR)
+    result = gain.copy()
+    target = result[y0:y1,x0:x1]
+    local_mask = mask[y0:y1,x0:x1]
+    target[local_mask] = np.exp2(full[local_mask])
+    info.update({'total_seconds':time.perf_counter()-started, 'mode':'generative',
+                 'controlnet':False, 'generation_grow':0, 'blur_sigma':0})
+    (directory/'report.json').write_text(json.dumps(info,indent=2))
+    return result
 
 
 def rebuild_uhdr(
@@ -548,9 +680,14 @@ def rebuild_uhdr(
     width: int,
     height: int,
     job_dir: Path,
+    gainmap_mode: str = 'smooth-interpolation',
+    source_path: Path | None = None,
 ) -> Path:
     gainmap, _, _ = compute_luminance_gainmap(hdr, original_sdr)
-    gainmap_erased = poisson_inpaint(gainmap, mask)
+    if gainmap_mode == 'generative':
+        gainmap_erased = generate_gainmap(gainmap, mask, job_dir)
+    else:
+        gainmap_erased = poisson_inpaint(gainmap, mask)
     # Shared log scale makes before/after brightness directly comparable.
     log_before = np.log2(np.maximum(gainmap, 1e-6))
     log_after = np.log2(np.maximum(gainmap_erased, 1e-6))
@@ -572,10 +709,23 @@ def rebuild_uhdr(
     command = [
         str(ULTRAHDR_APP), "-m", "0", "-p", str(hdr_raw), "-y", str(sdr_raw),
         "-w", str(width), "-h", str(height), "-a", "5", "-b", "3", "-t", "1",
-        "-C", "0", "-c", "0", "-M", "0", "-q", "100", "-Q", "100", "-z", str(output),
+        # Validated display path: preserve working RGB values and tag both
+        # intents Display P3. Do not apply another 709-to-P3 matrix here.
+        "-C", "1", "-c", "1", "-M", "0", "-q", "100", "-Q", "100", "-z", str(output),
     ]
+    if source_path is not None:
+        with Image.open(source_path) as source_image:
+            exif = source_image.info.get("exif")
+        if exif:
+            exif_path = job_dir / "source_exif.bin"
+            exif_path.write_bytes(exif)
+            command.extend(["-x", str(exif_path)])
     try:
         subprocess.run(command, check=True, capture_output=True, cwd=str(ROOT_DIR))
+        encoded = output.read_bytes()
+        if (b"urn:iso:std:iso:ts:21496:-1" not in encoded or
+                b"http://ns.adobe.com/hdr-gain-map/1.0/" not in encoded):
+            raise HTTPException(500, "HDR 编码器缺少 ISO/XMP 双格式支持，请按 README 重新编译")
     except (OSError, subprocess.CalledProcessError) as error:
         raise HTTPException(status_code=500, detail="SDR 已消除，但 Ultra HDR 重建失败") from error
     return output
@@ -797,10 +947,14 @@ async def erase(
     api_key: str = Form(""),
     test_image: str = Form(""),
     mask_expand: int = Form(0),
+    gainmap_mode: str = Form('generative'),
+    sdr_steps: int = Form(20),
 ):
     started = time.perf_counter()
+    if gainmap_mode not in {'generative', 'smooth-interpolation'} or sdr_steps not in {12,20}:
+        raise HTTPException(400, '无效的 Gainmap 模式或 SDR 步数')
     # model: local OpenCV, remote ComfyUI, or an OpenAI image model.
-    if model not in {"opencv", "comfyui", "comfyui-flux2", "gpt-image-1", "gpt-image-2", OPENAI_MODEL}:
+    if model not in {"opencv", "comfyui", "comfyui-flux2", "comfyui-flux-fill", "gpt-image-1", "gpt-image-2", OPENAI_MODEL}:
         raise HTTPException(status_code=400, detail=f"未知内容引擎 {model}")
 
     image_bytes, source_filename = await source_upload_bytes(image, test_image)
@@ -837,6 +991,8 @@ async def erase(
         original_sdr, hdr = decoded
         original_sdr = np.clip(np.round(original_sdr), 0, 255).astype(np.uint8)
 
+    preparation_seconds = time.perf_counter()-started
+    sdr_started = time.perf_counter()
     if model == "opencv":
         # Local, free content fill — validate the whole Ultra HDR path without OpenAI.
         erased_sdr = opencv_erase(original_sdr, erase_mask)
@@ -847,13 +1003,14 @@ async def erase(
             "cloud_input_size": [width, height],
             "cloud_output_size": "local",
         }
-    elif model in {"comfyui", "comfyui-flux2"}:
+    elif model in {"comfyui", "comfyui-flux2", "comfyui-flux-fill"}:
         erased_sdr, downscale = comfyui_downscaled_edit(
             original_sdr,
             erase_mask,
             prompt=prompt,
             cloud_input_path=job_dir / "cloud_input.png",
-            engine_override="flux2" if model == "comfyui-flux2" else None,
+            engine_override={"comfyui-flux2":"flux2", "comfyui-flux-fill":"flux-fill"}.get(model),
+            steps=sdr_steps,
         )
     else:
         key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "")
@@ -876,6 +1033,8 @@ async def erase(
     Image.fromarray(original_sdr).save(job_dir / "original_sdr.png")
     Image.fromarray(erased_sdr).save(preview_path)
 
+    sdr_seconds = time.perf_counter()-sdr_started
+    hdr_started = time.perf_counter()
     if hdr is not None:
         result_path = rebuild_uhdr(
             hdr,
@@ -885,6 +1044,8 @@ async def erase(
             width,
             height,
             job_dir,
+            gainmap_mode=gainmap_mode,
+            source_path=source_path,
         )
         result_kind = "Ultra HDR"
     else:
@@ -892,6 +1053,10 @@ async def erase(
         result_kind = "SDR"
 
     base_url = f"/results/{job_id}"
+    timings = {'preparation':preparation_seconds, 'sdr':sdr_seconds,
+               'gainmap_and_encode':time.perf_counter()-hdr_started,
+               'total':time.perf_counter()-started}
+    (job_dir/'timings.json').write_text(json.dumps({'seconds':timings, 'sdr':downscale},indent=2))
     return {
         "ok": True,
         "job_id": job_id,
@@ -908,4 +1073,6 @@ async def erase(
         "elapsed_ms": round((time.perf_counter() - started) * 1000),
         "model": model,
         "gainmap_channels": 1 if hdr is not None else None,
+        "gainmap_method": gainmap_mode if hdr is not None else None,
+        "timings_seconds": timings,
     }

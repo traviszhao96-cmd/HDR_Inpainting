@@ -58,6 +58,8 @@ outrgb.raw
 !/seg_ui/test_images/README.md
 /seg_ui/test_masks/
 /seg_ui/test_runs/
+# 本地作品集（全分辨率 UHDR 生成结果，数十 MB，仅留本机）
+/seg_ui/portfolio/
 *.tsbuildinfo
 # 未引用的示例图，排除
 /seg_ui/public/sample-building.jpg

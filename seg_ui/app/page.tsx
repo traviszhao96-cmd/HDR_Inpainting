@@ -27,6 +27,7 @@ const SAMPLE_URL = `${API_URL}/test-images/${DEFAULT_TEST_IMAGE}/preview`;
 const sliderValue = (value: number | readonly number[]) => typeof value === 'number' ? value : value[0];
 
 type EraseResult = {
+  job_id: string;
   comparisons?: { sdr: [string, string]; gainmap: [string, string] | null; hdr: [string, string] | null };
   kind: string;
   preview_url: string;
@@ -35,8 +36,10 @@ type EraseResult = {
   elapsed_ms: number;
   model: string;
   gainmap_channels: number | null;
+  timings_seconds?: { preparation: number; sdr: number; gainmap_and_encode: number; total: number };
   downscale: { source_size: [number, number]; cloud_input_size: [number, number]; cloud_output_size: string };
 };
+type PortfolioWork = { id: string; name: string; kind: string; url: string; preview_url: string; path: string };
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -72,13 +75,25 @@ export default function Home() {
   const [message, setMessage] = useState('按住画笔，沿着目标外围画一圈');
   const [device, setDevice] = useState('检测中');
   const [erasing, setErasing] = useState(false);
-  const [prompt, setPrompt] = useState('Remove the main foreground subject or object near the center of this crop. Reconstruct the background behind it using the visible surroundings as a guide, as if the target had never been there. Continue existing surfaces, edges, lines, textures, and color gradients naturally. Match the original perspective, lighting, colors, and level of detail. Preserve all other subjects and the surrounding scene. Do not replace the target with another object, invent new elements, or change the overall appearance of the photo.');
+  const [prompt, setPrompt] = useState('Remove all selected subjects and objects inside the mask. Reconstruct only empty, unoccupied background surfaces, continuing the surrounding geometry, textures and color gradients. Match perspective, lighting and colors. Do not generate any people, faces, heads, bodies, limbs, human silhouettes or portraits inside the mask. Do not replace the removed subject with another person or extend nearby people into the mask. Preserve existing people outside the mask. Do not add new objects.');
   const [eraseMessage, setEraseMessage] = useState('');
   const [eraseProgress, setEraseProgress] = useState(0);
   const [eraseElapsed, setEraseElapsed] = useState(0);
   const [eraseStage, setEraseStage] = useState('正在上传图片与蒙版…');
   const [eraseResult, setEraseResult] = useState<EraseResult | null>(null);
-  const [contentBackend, setContentBackend] = useState<'opencv' | 'comfyui-flux2'>('comfyui-flux2');
+  const [currentWork, setCurrentWork] = useState<EraseResult | null>(null);
+  const [portfolio, setPortfolio] = useState<PortfolioWork[]>([]);
+  const [workMessage, setWorkMessage] = useState('');
+  const [savingWork, setSavingWork] = useState(false);
+  useEffect(() => {
+    fetch(`${API_URL}/portfolio`).then(r => {
+      if (!r.ok) throw new Error('作品集加载失败');
+      return r.json() as Promise<{items: PortfolioWork[]}>;
+    }).then(data => setPortfolio(data.items)).catch(() => setWorkMessage('作品集暂不可用，请确认后端已启动'));
+  }, []);
+  const [contentBackend, setContentBackend] = useState<'opencv' | 'comfyui-flux-fill'>('comfyui-flux-fill');
+  const [gainmapMode, setGainmapMode] = useState('generative');
+  const [sdrSteps, setSdrSteps] = useState(20);
   const [testImages, setTestImages] = useState<TestImage[]>([]);
   const [testImageIndex, setTestImageIndex] = useState(-1);
   const [testSourceName, setTestSourceName] = useState<string | null>(DEFAULT_TEST_IMAGE);
@@ -89,18 +104,35 @@ export default function Home() {
     const timer = window.setInterval(() => {
       const seconds = (performance.now() - started) / 1000;
       setEraseElapsed(Math.floor(seconds));
-      // These phases are time estimates, not server-reported milestones.
-      const progress = seconds < 3 ? seconds / 3 * 10
-        : seconds < 25 ? 10 + (seconds - 3) / 22 * 75
-        : 85 + 10 * (1 - Math.exp(-(seconds - 25) / 8));
-      setEraseProgress(Math.min(95, Math.floor(progress)));
-      setEraseStage(seconds < 3 ? '正在上传图片与蒙版…'
-        : seconds < 25 ? '正在生成消除内容…'
-        : seconds < 40 ? '正在合成图像与重建 HDR…'
-        : '处理时间比预计稍长，正在等待结果…');
+      // Estimates only: no server milestones. Generative HDR budget ~120s.
+      const phases = gainmapMode === 'generative'
+        ? [{end:30, percent:20, label:'准备并上传图片与蒙版（预计）…'},
+           {end:75, percent:60, label:'生成 SDR 消除内容并回传（预计）…'},
+           {end:110, percent:90, label:'生成 Gainmap 并校正边缘（预计）…'},
+           {end:120, percent:95, label:'合成 HDR 并载入新底图（预计）…'}]
+        : contentBackend === 'opencv'
+          ? [{end:3, percent:20, label:'准备图片与蒙版（预计）…'},
+             {end:10, percent:95, label:'本地重建与合成（预计）…'}]
+          : [{end:30, percent:25, label:'准备并上传图片与蒙版（预计）…'},
+             {end:80, percent:85, label:'生成 SDR 消除内容并回传（预计）…'},
+             {end:90, percent:95, label:'Gainmap 插值与 HDR 合成（预计）…'}];
+      let previousEnd = 0;
+      let previousPercent = 0;
+      for (const phase of phases) {
+        if (seconds < phase.end) {
+          setEraseProgress(Math.floor(previousPercent + (phase.percent - previousPercent) *
+            (seconds - previousEnd) / (phase.end - previousEnd)));
+          setEraseStage(phase.label);
+          return;
+        }
+        previousEnd = phase.end;
+        previousPercent = phase.percent;
+      }
+      setEraseProgress(Math.min(99, Math.floor(95 + 4 * (1 - Math.exp(-(seconds - previousEnd) / 60)))));
+      setEraseStage('已超过预计时长，仍在等待处理结果，请勿重复提交…');
     }, 250);
     return () => window.clearInterval(timer);
-  }, [erasing]);
+  }, [erasing, gainmapMode, contentBackend]);
 
   const loadSampleBlob = useCallback(async () => {
     if (imageBlobRef.current) return;
@@ -205,7 +237,7 @@ export default function Home() {
         const right = Math.min(canvas.width, Math.max(...xs) + searchMargin);
         const bottom = Math.min(canvas.height, Math.max(...ys) + searchMargin);
         context.save();
-        context.strokeStyle = 'rgba(86, 214, 255, .9)';
+        context.strokeStyle = 'rgba(255, 255, 255, .65)';
         context.lineWidth = Math.max(3, canvas.width / 700);
         context.setLineDash([Math.max(10, canvas.width / 250), Math.max(7, canvas.width / 360)]);
         context.strokeRect(left, top, right - left, bottom - top);
@@ -215,7 +247,7 @@ export default function Home() {
       context.moveTo(lasso[0].x, lasso[0].y);
       for (const point of lasso.slice(1)) context.lineTo(point.x, point.y);
       if (!drawingRef.current) context.closePath();
-      context.strokeStyle = '#ffd45a';
+      context.strokeStyle = '#ffffff';
       context.lineWidth = Math.max(5, canvas.width / 430);
       context.lineCap = 'round';
       context.lineJoin = 'round';
@@ -242,9 +274,9 @@ export default function Home() {
       const pixels = maskCanvas.getContext('2d')!.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
       for (let index = 0; index < pixels.data.length; index += 4) {
         const coverage = Math.round(pixels.data[index] * pixels.data[index + 3] / 255);
-        pixels.data[index] = 25;
-        pixels.data[index + 1] = 230;
-        pixels.data[index + 2] = 140;
+        pixels.data[index] = 238;
+        pixels.data[index + 1] = 238;
+        pixels.data[index + 2] = 238;
         pixels.data[index + 3] = coverage;
       }
       tintContext.putImageData(pixels, 0, 0);
@@ -530,6 +562,8 @@ export default function Home() {
     setTestImageIndex(-1);
     setTestSourceName(null);
     clearSelection();
+    setCurrentWork(null);
+    setWorkMessage('');
   };
 
   const chooseTestImage = async (index: number) => {
@@ -549,6 +583,8 @@ export default function Home() {
       setTestImageIndex(index);
       setTestSourceName(item.name);
       clearSelection();
+      setCurrentWork(null);
+      setWorkMessage('');
     } catch {
       setImageReady(false);
       setMessage('测试图片载入失败');
@@ -578,13 +614,29 @@ export default function Home() {
       body.append('image', imageBlobRef.current, fileName);
       if (testSourceName) body.append('test_image', testSourceName);
       body.append('mask', maskBlobRef.current, 'erase_mask.png');
+      body.append('gainmap_mode', gainmapMode);
+      body.append('sdr_steps', String(sdrSteps));
       body.append('prompt', prompt);
       body.append('model', contentBackend);
       body.append('mask_expand', String(maskExpand));
       const response = await fetch(`${API_URL}/erase`, { method: 'POST', body });
-      const data = await response.json();
+      const data = await response.json() as EraseResult & {detail?: string};
       if (!response.ok) throw new Error(data.detail ?? '消除失败');
-      setEraseResult(data as EraseResult);
+      setCurrentWork(data);
+      // Next edit uploads the actual UHDR, never the SDR comparison preview.
+      const nextResponse = await fetch(`${API_URL}${data.download_url}`);
+      if (!nextResponse.ok) throw new Error('消除已完成，但新底图加载失败；仍可保存到作品集');
+      const nextBlob = await nextResponse.blob();
+      imageBlobRef.current = nextBlob;
+      if (imageUrl.startsWith('blob:')) URL.revokeObjectURL(imageUrl);
+      setImageUrl(`${API_URL}${data.preview_url}`);
+      setFileName(`edited-${data.job_id}.${data.kind === 'Ultra HDR' ? 'jpg' : 'png'}`);
+      setTestSourceName(null);
+      setTestImageIndex(-1);
+      clearSelection();
+      setImageReady(true);
+      setEraseResult(data);
+      setWorkMessage('新图已成为当前底图，可继续圈选消除，或保存到作品集');
       setEraseProgress(100);
       setEraseMessage(`消除与合成完成 · 100% · ${(data.elapsed_ms / 1000).toFixed(1)} 秒`);
     } catch (error) {
@@ -594,26 +646,61 @@ export default function Home() {
     }
   };
 
+  const saveWork = async () => {
+    if (!currentWork || savingWork) return;
+    setSavingWork(true);
+    try {
+      const body = new FormData(); body.append('job_id', currentWork.job_id);
+      const response = await fetch(`${API_URL}/portfolio`, {method:'POST', body});
+      if (!response.ok) throw new Error('作品保存失败');
+      const item = await response.json() as PortfolioWork;
+      setPortfolio(previous => [item, ...previous.filter(work => work.id !== item.id)]);
+      setWorkMessage(`已保存到本地：${item.path}`);
+    } catch (error) { setWorkMessage(error instanceof Error ? error.message : '保存失败'); }
+    finally { setSavingWork(false); }
+  };
+
+  const openWork = async (work: PortfolioWork) => {
+    if (erasing || loading) return;
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_URL}${work.url}`);
+      if (!response.ok) throw new Error('无法打开作品');
+      const blob = await response.blob();
+      if (imageUrl.startsWith('blob:')) URL.revokeObjectURL(imageUrl);
+      imageBlobRef.current = blob;
+      setImageUrl(`${API_URL}${work.preview_url}`);
+      setFileName(work.url.split('/').at(-1)!);
+      setTestSourceName(null); setTestImageIndex(-1);
+      clearSelection(); setCurrentWork(null); setImageReady(true);
+      setWorkMessage('作品已载入，可继续编辑；原作品不会被覆盖');
+    } catch (error) { setWorkMessage(error instanceof Error ? error.message : '加载失败'); }
+    finally { setLoading(false); }
+  };
+
   return (
-    <main className="min-h-screen bg-[#070b0a] text-[#eff8f3]">
+    <main className="min-h-screen bg-[#101010] text-[#f2f2f2]">
       <header className="flex h-16 items-center justify-between border-b border-white/10 px-4 sm:px-7">
         <div className="flex items-center gap-3">
-          <div className="grid size-9 place-items-center rounded-xl bg-[#19e68c] text-[#04100a]"><Sparkles className="size-5" /></div>
-          <div><h1 className="text-base font-semibold tracking-tight">HDR 对象消除</h1><p className="text-xs text-white/45">本地分割 · 局部云端验证 · 本机重建 HDR</p></div>
+          <div className="grid size-9 place-items-center rounded-xl bg-[#ededed] text-[#151515]"><Sparkles className="size-5" /></div>
+          <div><p className="mb-1 text-[10px] font-medium tracking-[0.28em] text-white/45">HDR / PHOTO STUDIO</p><h1 className="text-base font-semibold tracking-tight">HDR 对象消除</h1><p className="text-xs text-white/45">本地圈选 · SDR 消除 · 可选生成式 Gainmap · HDR 合成</p></div>
         </div>
-        <Badge className="border border-[#19e68c]/25 bg-[#19e68c]/10 text-[#83f5bb]"><span className="size-1.5 rounded-full bg-[#19e68c]" />{device}</Badge>
+        <Badge className="border border-[#ededed]/25 bg-[#ededed]/10 text-[#dddddd]"><span className="size-1.5 rounded-full bg-[#ededed]" />{device}</Badge>
       </header>
 
       <section className="mx-auto flex min-h-[calc(100vh-4rem)] w-full max-w-[1680px] flex-col gap-4 p-3 sm:p-5">
+        <ol aria-label="处理流程" className="grid grid-cols-2 gap-2 rounded-xl border border-white/10 bg-[#181818] p-3 text-xs sm:grid-cols-4">
+          {['1 · 圈选并确认蒙版', '2 · SDR 内容消除', '3 · Gainmap 重建', '4 · 合成并对比 HDR'].map(step => <li key={step} className="rounded-lg bg-white/5 px-3 py-2 text-white/75">{step}</li>)}
+        </ol>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="flex items-center gap-2 text-sm font-medium"><Pencil className="size-4 text-[#ffd45a]" />{maskUrl ? '检查并修补蒙版' : '第一步：圈选对象'}</div>
+            <div className="flex items-center gap-2 text-sm font-medium"><Pencil className="size-4 text-[#ffffff]" />{maskUrl ? '检查并修补蒙版' : '第一步：圈选对象'}</div>
             <p className="mt-1 truncate text-xs text-white/45">{fileName} · {message}</p>
           </div>
           <div className="flex flex-wrap gap-2">
             {testImages.length > 0 && <>
               <Button variant="outline" className="border-white/10 bg-white/5 text-white hover:bg-white/10" onClick={() => stepTestImage(-1)}>上一张</Button>
-              <select value={testImageIndex} onChange={(event) => void chooseTestImage(Number(event.target.value))} className="h-10 max-w-56 rounded-lg border border-white/10 bg-[#0c1411] px-3 text-sm text-white outline-none focus:border-[#19e68c]/60" aria-label="选择测试图片">
+              <select value={testImageIndex} onChange={(event) => void chooseTestImage(Number(event.target.value))} className="h-10 max-w-56 rounded-lg border border-white/10 bg-[#181818] px-3 text-sm text-white outline-none focus:border-[#ededed]/60" aria-label="选择测试图片">
                 {testImages.map((item, index) => <option key={item.name} value={index}>{item.name}</option>)}
               </select>
               <Button variant="outline" className="border-white/10 bg-white/5 text-white hover:bg-white/10" onClick={() => stepTestImage(1)}>下一张</Button>
@@ -625,14 +712,14 @@ export default function Home() {
         </div>
 
         <div className="grid items-start gap-4 lg:grid-cols-[220px_minmax(0,1fr)_280px]">
-        <div className="relative flex min-h-[55vh] items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-[radial-gradient(circle_at_50%_30%,#17211d_0%,#070a09_62%)] shadow-2xl lg:col-start-2 lg:row-start-1">
+        <div className="relative flex min-h-[55vh] items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-[radial-gradient(circle_at_50%_30%,#222222_0%,#101010_62%)] shadow-2xl lg:col-start-2 lg:row-start-1">
           <div className="relative max-h-[calc(100vh-13.5rem)] max-w-full select-none">
             {imageUrl && <img ref={imageRef} src={imageUrl} alt="待圈选图片" onLoad={onImageLoad} className="block max-h-[calc(100vh-13.5rem)] max-w-full object-contain" draggable={false} />}
             <canvas ref={canvasRef} aria-label="用画笔圈选对象" className="absolute inset-0 h-full w-full cursor-crosshair touch-none" onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={finishLasso} onPointerCancel={finishLasso} />
           </div>
           {!lasso.length && !loading && <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full border border-white/10 bg-black/70 px-4 py-2 text-center text-sm text-white/75 shadow-xl backdrop-blur-md">按住鼠标或手指，沿对象外围画一圈</div>}
-          {maskUrl && !loading && <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full border border-[#19e68c]/25 bg-black/75 px-4 py-2 text-center text-sm text-white/80 shadow-xl backdrop-blur-md">绿色必须完整覆盖对象；漏选用“添加”，误选用“擦除”</div>}
-          {loading && <div className="absolute inset-0 grid place-items-center bg-black/25 backdrop-blur-[1px]"><div className="flex items-center gap-2 rounded-full border border-white/10 bg-[#0b100e]/95 px-4 py-2 text-sm shadow-xl"><Spinner className="text-[#19e68c]" /> 正在分割圈内对象</div></div>}
+          {maskUrl && !loading && <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full border border-[#ededed]/25 bg-black/75 px-4 py-2 text-center text-sm text-white/80 shadow-xl backdrop-blur-md">浅色蒙版必须完整覆盖对象；漏选用“添加”，误选用“擦除”</div>}
+          {loading && <div className="absolute inset-0 grid place-items-center bg-black/25 backdrop-blur-[1px]"><div className="flex items-center gap-2 rounded-full border border-white/10 bg-[#191919]/95 px-4 py-2 text-sm shadow-xl"><Spinner className="text-[#ededed]" /> 正在分割圈内对象</div></div>}
         </div>
 
         <aside className="flex flex-col gap-5 rounded-2xl border border-white/10 bg-white/[0.035] p-4 lg:col-start-1 lg:row-start-1">
@@ -640,8 +727,8 @@ export default function Home() {
           <p className="text-xs text-white/45">每次只圈一个主体 · 松手自动闭合 · 自动去除不相连的碎片、填孔和平滑</p>
           <Button variant="outline" onClick={clearSelection} disabled={loading || erasing}><Pencil />重新圈选</Button>
           {maskUrl && <div className="flex flex-col gap-2">
-            <Button variant={editMode === 'add' ? 'default' : 'outline'} className={editMode === 'add' ? 'bg-[#19e68c] text-[#04100a] hover:bg-[#6af0ad]' : 'border-white/10 bg-white/5 text-white hover:bg-white/10'} onClick={() => setEditMode('add')}><Paintbrush /> 添加蒙版</Button>
-            <Button variant={editMode === 'erase' ? 'default' : 'outline'} className={editMode === 'erase' ? 'bg-[#ff6b75] text-white hover:bg-[#ff8790]' : 'border-white/10 bg-white/5 text-white hover:bg-white/10'} onClick={() => setEditMode('erase')}><Eraser /> 擦除蒙版</Button>
+            <Button variant={editMode === 'add' ? 'default' : 'outline'} className={editMode === 'add' ? 'bg-[#ededed] text-[#151515] hover:bg-[#ffffff]' : 'border-white/10 bg-white/5 text-white hover:bg-white/10'} onClick={() => setEditMode('add')}><Paintbrush /> 添加蒙版</Button>
+            <Button variant={editMode === 'erase' ? 'default' : 'outline'} className={editMode === 'erase' ? 'bg-[#dddddd] text-[#151515] hover:bg-[#ffffff]' : 'border-white/10 bg-white/5 text-white hover:bg-white/10'} onClick={() => setEditMode('erase')}><Eraser /> 擦除蒙版</Button>
             <Button variant="outline" className="border-white/10 bg-white/5 text-white hover:bg-white/10" onClick={undoMaskEdit} disabled={!canUndoMask}><Undo2 /> 撤销</Button>
             <Button variant="outline" className="border-white/10 bg-white/5 text-white hover:bg-white/10" onClick={useLassoAsMask}>套索直接作为蒙版</Button>
           </div>}
@@ -658,9 +745,10 @@ export default function Home() {
           {maskSaveMessage && <p role="status" className="break-all text-xs text-white/60">{maskSaveMessage}</p>}
         </aside>
 
-        <section className="grid gap-4 rounded-2xl border border-[#19e68c]/20 bg-[#0c1411] p-4 lg:col-start-3 lg:row-start-1">
+        <section className="grid gap-4 rounded-2xl border border-[#ededed]/20 bg-[#181818] p-4 lg:col-start-3 lg:row-start-1">
           <div>
-            <div className="mb-3 flex items-center gap-2 text-sm font-semibold"><Eraser className="size-4 text-[#19e68c]" />第二步：内容消除</div>
+            <div className="mb-3 flex items-center gap-2 text-sm font-semibold"><Eraser className="size-4 text-[#ededed]" />第二步：内容消除</div>
+            <p className="mb-3 text-xs text-white/55">确认绿色区域完整覆盖目标；阴影需要消除时请一并涂入。仅重建无人背景，但模型仍可能生成新人物，请检查结果。</p>
             <Textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} className="min-h-64 border-white/10 bg-black/20 text-white" aria-label="消除提示词" />
           </div>
           <div className="flex flex-col justify-between gap-3">
@@ -668,29 +756,50 @@ export default function Home() {
             <div className="space-y-3">
               <div>
                 <label className="mb-1.5 flex items-center gap-2 text-sm text-white/70" htmlFor="content-backend"><Eraser className="size-4" />内容引擎</label>
-                <select id="content-backend" value={contentBackend} onChange={(event) => setContentBackend(event.target.value as 'opencv' | 'comfyui-flux2')} className="h-10 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-[#19e68c]/60">
-                  <option value="opencv" className="bg-[#0c1411]">OpenCV 重建</option>
-                  <option value="comfyui-flux2" className="bg-[#0c1411]">FLUX.2 Klein 4B · FP8</option>
+                <select id="content-backend" disabled={erasing} value={contentBackend} onChange={(event) => setContentBackend(event.target.value as 'opencv' | 'comfyui-flux-fill')} className="h-10 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm text-white outline-none focus:border-[#ededed]/60">
+                  <option value="opencv" className="bg-[#181818]">OpenCV 重建</option>
+                  <option value="comfyui-flux-fill" className="bg-[#181818]">FLUX.1 Fill-dev · Q4_K_S + 消除 LoRA v2</option>
                 </select>
               </div>
+              <label className="block text-xs text-white/65">SDR 生成步数
+                <select value={sdrSteps} disabled={erasing || contentBackend === 'opencv'} onChange={e => setSdrSteps(Number(e.target.value))} className="mt-2 h-10 w-full rounded-lg bg-[#262626] px-3">
+                  <option value={20}>20 步 · 当前基准</option><option value={12}>12 步 · 加速试验，可能影响质量</option>
+                </select>
+              </label>
+              <label className="block text-xs text-white/65">Gainmap 方案
+                <select value={gainmapMode} disabled={erasing} onChange={e => setGainmapMode(e.target.value)} className="mt-2 h-10 w-full rounded-lg bg-[#262626] px-3">
+                  <option value="generative">生成式 · FLUX Fill + 消除 LoRA · 8 步</option>
+                  <option value="smooth-interpolation">快速平滑插值 · 无额外模型调用</option>
+                </select>
+              </label>
+              <p className="text-xs text-white/45">生成式为实验方案：最长边 576px、单通道、无 ControlNet / RGB 引导、无额外外扩或高斯模糊；需额外一次远程生成，不保证更快。普通 SDR 图片跳过此步骤。</p>
+              {eraseResult?.timings_seconds && <p className="text-xs text-white/60">实际耗时：准备 {eraseResult.timings_seconds.preparation.toFixed(1)}s · SDR {eraseResult.timings_seconds.sdr.toFixed(1)}s · Gainmap / 合成 {eraseResult.timings_seconds.gainmap_and_encode.toFixed(1)}s</p>}
             </div>
-            <div><Button className="h-11 w-full bg-[#19e68c] text-[#04100a] hover:bg-[#6af0ad]" disabled={erasing || loading || !maskUrl} onClick={() => void runErase()}>{erasing ? <Spinner /> : <Sparkles />} {erasing ? '正在处理…' : '开始消除'}</Button>{erasing && <div className="mt-3 space-y-2"><div className="flex justify-between gap-2 text-xs text-white/75"><span>{eraseStage}</span><span>{eraseProgress}%</span></div><div role="progressbar" aria-label="预计消除进度" aria-valuenow={eraseProgress} aria-valuemin={0} aria-valuemax={100} className="h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#19e68c] transition-all duration-300" style={{ width: `${eraseProgress}%` }} /></div><p className="text-xs text-white/40">阶段与百分比为估算 · 通常约 30 秒 · 已用 {eraseElapsed} 秒</p></div>}{eraseMessage && <p className={`mt-2 text-xs ${eraseMessage.includes('完成') ? 'text-[#75efb1]' : 'text-white/55'}`}>{eraseMessage}</p>}</div>
+            <div><Button className="h-11 w-full bg-[#ededed] text-[#151515] hover:bg-[#ffffff]" disabled={erasing || loading || !maskUrl} onClick={() => void runErase()}>{erasing ? <Spinner /> : <Sparkles />} {erasing ? '正在处理…' : '开始消除'}</Button>{erasing && <div className="mt-3 space-y-2"><div className="flex justify-between gap-2 text-xs text-white/75"><span>{eraseStage}</span><span>{eraseProgress}%</span></div><div role="progressbar" aria-label="预计消除进度" aria-valuenow={eraseProgress} aria-valuemin={0} aria-valuemax={100} className="h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#ededed] transition-all duration-300" style={{ width: `${eraseProgress}%` }} /></div><p className="text-xs text-white/40">阶段与百分比为估算 · {gainmapMode === 'generative' ? '生成式 HDR 通常约 2 分钟；普通 SDR 会跳过 Gainmap' : '耗时取决于选区与远程状态'} · 已用 {eraseElapsed} 秒</p></div>}{eraseMessage && <p className={`mt-2 text-xs ${eraseMessage.includes('完成') ? 'text-[#eeeeee]' : 'text-white/55'}`}>{eraseMessage}</p>}</div>
           </div>
         </section>
         </div>
 
-        <section className="rounded-2xl border border-white/10 bg-[#0c1411] p-4">
+        <section className="rounded-2xl border border-white/10 bg-[#181818] p-4">
           <h2 className="mb-2 font-semibold">测试样张</h2>
           <p className="mb-4 text-xs text-white/45">将图片放入 seg_ui/test_images 文件夹，刷新页面即可加入图集。</p>
           <div className="flex gap-3 overflow-x-auto pb-2">
-            {testImages.map((item, index) => <button key={item.name} disabled={erasing || loading} onClick={() => void chooseTestImage(index)} aria-pressed={testSourceName === item.name} className={`w-40 shrink-0 overflow-hidden rounded-xl border text-left disabled:opacity-40 ${testSourceName === item.name ? 'border-[#19e68c] bg-[#19e68c]/10' : 'border-white/10 bg-black/20'}`}>
+            {testImages.map((item, index) => <button key={item.name} disabled={erasing || loading} onClick={() => void chooseTestImage(index)} aria-pressed={testSourceName === item.name} className={`w-40 shrink-0 overflow-hidden rounded-xl border text-left disabled:opacity-40 ${testSourceName === item.name ? 'border-[#ededed] bg-[#ededed]/10' : 'border-white/10 bg-black/20'}`}>
               <img src={`${API_URL}${item.url}`} alt={item.name} loading="lazy" className="h-28 w-full object-cover" />
               <span className="block truncate px-3 py-2 text-xs">{item.name}</span>
             </button>)}
           </div>
         </section>
 
-        <section className="space-y-4 rounded-2xl border border-white/10 bg-[#0c1411] p-4">
+        <section className="space-y-4 rounded-2xl border border-white/10 bg-[#181818] p-4">
+          <div className="flex items-center justify-between"><h2 className="text-sm font-semibold">作品集</h2><Button onClick={() => void saveWork()} disabled={!currentWork || savingWork || erasing || loading}>{savingWork ? '保存中…' : '保存当前作品'}</Button></div>
+          <p className="text-xs text-white/50">消除后自动替换编辑底图 · 保存完整 UHDR / SDR 到本地 seg_ui/portfolio · 点击作品可继续编辑</p>
+          {workMessage && <p className="break-all text-xs text-white/70">{workMessage}</p>}
+          <div className="flex gap-3 overflow-x-auto">{portfolio.map(work => <div key={work.id} className="w-40 shrink-0 rounded-lg border border-white/15 p-2"><button disabled={erasing || loading} onClick={() => void openWork(work)} className="w-full text-left"><img src={`${API_URL}${work.preview_url}`} alt={work.name} className="h-32 w-full rounded object-cover" /><p className="mt-2 text-xs">{work.name}</p><p className="text-xs text-white/50">{work.kind}</p></button><a href={`${API_URL}${work.url}`} download className="mt-2 block text-xs underline">下载完整文件</a></div>)}</div>
+          {!portfolio.length && <p className="text-xs text-white/40">还没有保存的作品</p>}
+        </section>
+
+        <section className="space-y-4 rounded-2xl border border-white/10 bg-[#181818] p-4">
           <h2 className="font-semibold">消除前后对比</h2>
           {(['sdr', 'gainmap', 'hdr'] as const).map((kind) => {
             const pair = eraseResult?.comparisons?.[kind];
@@ -705,7 +814,7 @@ export default function Home() {
           })}
         </section>
 
-        {eraseResult && <div className="flex items-center justify-between rounded-xl border border-white/10 p-4"><span className="text-sm text-white/60">消除完成 · {(eraseResult.elapsed_ms / 1000).toFixed(1)} 秒</span><a className="rounded-lg bg-[#19e68c] px-4 py-2 text-sm text-[#04100a]" href={`${API_URL}${eraseResult.download_url}`} download>下载 {eraseResult.kind}</a></div>}
+        {eraseResult && <div className="flex items-center justify-between rounded-xl border border-white/10 p-4"><span className="text-sm text-white/60">消除完成 · {(eraseResult.elapsed_ms / 1000).toFixed(1)} 秒</span><a className="rounded-lg bg-[#ededed] px-4 py-2 text-sm text-[#151515]" href={`${API_URL}${eraseResult.download_url}`} download>下载 {eraseResult.kind}</a></div>}
       </section>
     </main>
   );

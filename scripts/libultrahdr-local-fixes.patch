@@ -1,0 +1,48 @@
+diff --git a/examples/ultrahdr_app.cpp b/examples/ultrahdr_app.cpp
+index 3f03205..93eec0c 100644
+--- a/examples/ultrahdr_app.cpp
++++ b/examples/ultrahdr_app.cpp
+@@ -607,7 +607,10 @@ bool UltraHdrAppInput::fillExifMemoryBlock() {
+   if (ifd.good()) {
+     auto size = ifd.tellg();
+     ifd.close();
+-    return loadFile(mExifFile, mExifBlock.data, size);
++    if (!loadFile(mExifFile, mExifBlock.data, size)) return false;
++    mExifBlock.data_sz = static_cast<size_t>(size);
++    mExifBlock.capacity = static_cast<size_t>(size);
++    return true;
+   }
+   return false;
+ }
+diff --git a/lib/src/dsp/arm/gainmapmath_neon.cpp b/lib/src/dsp/arm/gainmapmath_neon.cpp
+index 306a971..93ace69 100644
+--- a/lib/src/dsp/arm/gainmapmath_neon.cpp
++++ b/lib/src/dsp/arm/gainmapmath_neon.cpp
+@@ -330,12 +330,10 @@ uhdr_error_info_t convertYuv_neon(uhdr_raw_image_t* image, uhdr_color_gamut_t sr
+ ALIGNED(16)
+ const uint16_t kRgb709ToYuv_coeffs_neon[8] = {3484, 11717, 1183, 1877, 6315, 8192, 7441, 751};
+ 
+-// RGB Display P3 -> Yuv Display P3
+-// Y = 0.2289746 * R + 0.6917385 * G + 0.0792869 * B
+-// U = -0.124346335 * R + -0.375653665 * G + 0.5 * B
+-// V = 0.5 * R + -0.448583471 * G + -0.051416529 * B
++// Display P3 JPEG uses BT.601 YCbCr, matching p3RgbToYuv().
++// These are encoding coefficients, not Display P3 luminance weights.
+ ALIGNED(16)
+-const uint16_t kRgbDispP3ToYuv_coeffs_neon[8] = {3752, 11333, 1299, 2037, 6155, 8192, 7350, 842};
++const uint16_t kRgbDispP3ToYuv_coeffs_neon[8] = {4899, 9617, 1868, 2765, 5427, 8192, 6860, 1332};
+ 
+ // RGB Bt2100 -> Yuv Bt2100
+ // Y = 0.2627 * R + 0.677998 * G + 0.059302 * B
+@@ -462,9 +460,9 @@ std::unique_ptr<uhdr_raw_image_ext_t> convert_raw_input_to_ycbcr_neon(uhdr_raw_i
+     if (src->cg == UHDR_CG_BT_709) {
+       coeffs_ptr = kRgb709ToYuv_coeffs_neon;
+     } else if (src->cg == UHDR_CG_BT_2100) {
+-      coeffs_ptr = kRgbDispP3ToYuv_coeffs_neon;
+-    } else if (src->cg == UHDR_CG_DISPLAY_P3) {
+       coeffs_ptr = kRgb2100ToYuv_coeffs_neon;
++    } else if (src->cg == UHDR_CG_DISPLAY_P3) {
++      coeffs_ptr = kRgbDispP3ToYuv_coeffs_neon;
+     } else {
+       return dst;
+     }

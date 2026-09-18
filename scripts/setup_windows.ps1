@@ -10,7 +10,7 @@ git submodule update --init
 
 Write-Host "==> 2. 构建 ultrahdr_app (CMake/MSVC)" -ForegroundColor Cyan
 Set-Location (Join-Path $Root "libultrahdr")
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUHDR_WRITE_ISO=ON -DUHDR_WRITE_XMP=ON
 cmake --build build --config Release --target ultrahdr_app
 
 # 定位产物并复制到根目录 build/
