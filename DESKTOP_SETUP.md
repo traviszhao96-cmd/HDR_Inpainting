@@ -1,72 +1,92 @@
-# 桌面端（Windows, RTX 4070 TiS）搭建与运行
+# 部署与运行（M4 前端/管线 + Windows 台式机 GPU 服务）
 
-本仓库已把 `libultrahdr` 作为 **git 子模块** 纳入，因此台式机 `git clone` 后即可拿到并构建项目所需的
-`ultrahdr_app`（Ultra HDR 编解码）。本机（Mac, M4）负责开发/前端/轻活；**台式机作为"单一 GPU 服务"**
-（SAM2 分割 + 内容生成 + 重建 HDR）。
+> 更新时间：2026-09-18
+> 现状架构：**Mac(M4) 跑 seg_ui（前端 + 后端 + SAM 分割 + gainmap 重建 + HDR 编码）**，
+> **Windows 台式机(RTX 4070 TiS) 跑 ComfyUI 作为内容生成 GPU 服务**，两者通过 **Tailscale** 内网互访。
 
 ---
 
-## 1. 前提（Windows）
+## 0. 角色分工
 
-- Git
-- Python 3.10+（独立 venv）
-- CMake ≥ 3.16
-- C++ 编译器：**Visual Studio 2019/2022 Build Tools（MSVC）** 或 MinGW
-- 显卡驱动对应 CUDA（4070 TiS 建议 CUDA 12.x）
+| 机器 | 职责 |
+|------|------|
+| **Mac (M4)** | seg_ui 前端(3000) + 后端(7860)；SAM2.1 分割(MPS)；gainmap 重建；libultrahdr 编码；本地作品集 |
+| **Windows 台式机 (4070 TiS)** | ComfyUI(8188)。内容引擎：FLUX.1 Fill、SD1.5-inpaint、LaMa 等；生成式 gainmap |
+| **连接** | Tailscale（`https://win-hm9ig3vhnaa.tailfff622.ts.net`），无需公网暴露、无需付费远程桌面 |
 
-## 2. 克隆 + 拉子模块
+---
 
-```bat
+## 1. 克隆 + 子模块 + 本机补丁
+
+```bash
 git clone git@github.com:traviszhao96-cmd/HDR_Inpainting.git
 cd HDR_Inpainting
 git submodule update --init
+# 应用本机对 libultrahdr 的两处修复（子模块无法 push，必须打补丁）
+cd libultrahdr && git apply ../scripts/libultrahdr-local-fixes.patch && cd ..
 ```
-> 说明：`libultrahdr` 子模块指向 google/libultrahdr @ 93c2349；（含上游测试图，首次拉取约几百 MB）。
-> 只想快速构建可改用浅拉：`git submodule update --init --depth 1`（更小，但可能非锁定提交）。
+> `libultrahdr` 指向 `google/libultrahdr @ 93c2349`（含上游测试图，首次拉取约几百 MB）。
+> 补丁内容见 `scripts/README.md`：EXIF 长度、NEON P3/BT.2020 系数分支。
 
-## 3. 构建 ultrahdr_app
+## 2. 构建 ultrahdr_app（必须开 ISO + XMP 元数据）
 
-```bat
-cd libultrahdr
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --target ultrahdr_app
-REM 产物：libultrahdr/build/Release/ultrahdr_app.exe
+HDR 输出为 **Display P3 JPEG HDR**，编码器需同时写 ISO 21496-1 与 XMP gainmap 元数据：
+
+```bash
+cmake -S libultrahdr -B build -DUHDR_WRITE_ISO=ON -DUHDR_WRITE_XMP=ON
+cmake --build build -j 6            # 产物 build/ultrahdr_app（Windows 为 ultrahdr_app.exe）
 ```
-复制到根目录 `build/` 下（管线默认在 `build/ultrahdr_app` 找）：
-```bat
-mkdir ..\build 2>nul
-copy build\Release\ultrahdr_app.exe ..\build\ultrahdr_app.exe
+> Windows 下构建 `ultrahdr_app` 后复制到仓库根 `build/`（管线默认路径 `build/ultrahdr_app`）。
+
+## 3. Windows 台式机：ComfyUI GPU 服务
+
+1. 安装 ComfyUI + 自定义节点（GGUF、AusBoss 等），放置模型：
+   - `models/unet/`：`flux-1-fill-dev-Q4_K_S.gguf`（或对应名）+ Klein 变体
+   - `models/loras/`：`removal_timestep_alpha-2-1740.safetensors`（ObjectRemovalFluxFill v2）
+   - `models/checkpoints/`：`sd-v1-5-inpainting.safetensors`
+   - `models/lama/`：`big-lama.pt`（AusBoss LaMa 节点用）
+2. 启动（**绑定 0.0.0.0 以便 Tailscale 访问**）：
+   ```bat
+   python main.py --listen 0.0.0.0 --port 8188
+   ```
+3. 用 Tailscale 让 M4 可达：`tailscale up`（同一 tailnet），M4 用
+   `https://win-hm9ig3vhnaa.tailfff622.ts.net` 访问其 `/system_stats`、`/prompt`。
+4. 校验：浏览器打开该地址能进 ComfyUI；`curl <url>/system_stats` 返回 JSON。
+
+## 4. M4：seg_ui（前端 + 后端）
+
+```bash
+cd seg_ui
+./run-local.sh        # 自动建 venv、装依赖、导出 COMFYUI_URL、起后端 7860 + 前端 3000
 ```
-> 注：管线里 `ULTRAHDR_APP = build/ultrahdr_app`；Windows 下是 `ultrahdr_app.exe`。
-> 若你直接改 `hdr_ai_erase.py` / `seg_ui/backend/app.py` 里的 `ULTRAHDR_APP` 指向该 exe 更省事。
+`run-local.sh` 已带以下环境变量（可用同名 shell 变量覆盖）：
+```
+COMFYUI_URL=https://win-hm9ig3vhnaa.tailfff622.ts.net
+COMFYUI_ENGINE=sd15          # 前端默认会覆盖为 comfyui-flux-fill
+COMFYUI_CHECKPOINT=sd-v1-5-inpainting.safetensors
+COMFYUI_LAMA_MODEL=big-lama.pt
+COMFYUI_WORK_SIZE=768
+```
+打开 <http://localhost:3000>：圈选对象 → 选内容引擎（**FLUX.1 Fill-dev + 消除 LoRA v2** 为默认）→ 继续消除。
 
-## 4. Python 环境
+## 5. 内容引擎与 gainmap 模式
 
-```bat
-python -m venv .venv && .venv\Scripts\activate
-pip install numpy pillow opencv-python-headless requests
-REM 若要运行 seg_ui 后端（SAM2 分割 + /erase）：
-pip install torch torchvision transformers fastapi uvicorn python-multipart
+- **内容引擎**（前端下拉）：`comfyui-flux-fill`（默认）/ `sd15` / `lama` / `opencv`。
+- **gainmap 模式**（前端下拉）：
+  - `generative`（**默认**）：FLUX Fill 8 步、最长边 576，实验性（非 HDR 训练模型）；
+  - `smooth-interpolation`：谐波/Poisson 插值，约 0.85s，稳定但平淡。
+- 输出：单通道 gainmap 的 **Display P3 JPEG HDR**，EXIF 经编码器 `-x` 写入。
+
+## 6. 离线回归（不调用生成模型）
+
+```bash
+seg_ui/.venv/bin/python -m unittest seg_ui.backend.test_hdr_export
+seg_ui/.venv/bin/python -m unittest seg_ui.backend.test_sdr_composite
 ```
 
-## 5. 启动（本机监听 + Tailscale 私有访问）
+## 7. 隐私与泄漏防护（重要）
 
-```bat
-REM 后台常驻：python -m uvicorn backend.app:app --host 127.0.0.1 --port 7860
-REM 前端（seg_ui）：
-npm install && npm run dev
-```
-- 安全：后端/前端都绑 `127.0.0.1`，**不要** `--listen 0.0.0.0` 裸暴露。
-- 远程访问用 **Tailscale**：`tailscale serve --bg 7860`（把本机 7860 暴露给 tailnet，走加密通道，不开放公网端口）。
-- `seg_ui` 默认从 `http://127.0.0.1:7860` 拉后端；外部用 Tailscale 地址访问 `http://<台式机>.ts.net:7860`。
-
-## 6. 内容引擎
-
-- seg_ui 的 `/erase` 支持 **OpenCV 本地（免费，验证通路）** 或 **gpt-image-2（云端，需 API Key）**。
-- 台式机上跑 `hdr_ai_erase.py` 也一样：`python hdr_ai_erase.py --inpainter opencv --mask mask.png`。
-
-## 7. 泄漏防护（重要）
-
-- `.qq_smtp.env`、`*.env`、`*.key`、`*token*` 均被 `.gitignore` 忽略——**不要**把任何 API Key / 授权码提交。
-- `output/`、`build/`、`*.raw` 等大体积产物不入库。
-- ComfyUI 无鉴权、节点可执行代码：永远绑 `127.0.0.1`，远程走 Tailscale，别用 `0.0.0.0`/UPnP/明文端口暴露。
+- **仅留本机、不入库**：`seg_ui/test_images/*`（除 README）、`test_masks/`、`test_runs/`、`results/`、`portfolio/`、`output/`、`build/`、`*.raw`。
+- **密钥**：`qwen.env`、`qwen.env.save`、`*.env`、`*.key`、`*token*` 均被 `.gitignore` 忽略；不要写进代码或提交。
+- **ComfyUI 无鉴权、节点可执行代码**：台式机 ComfyUI 只绑内网（Tailscale），不要 `0.0.0.0` 暴露到公网、不要开 UPnP；只用信任的自定义节点。
+- 论文/评审文档中引用的样张、原始输出保存在本机 `test_runs/`，不随 Git 同步。
