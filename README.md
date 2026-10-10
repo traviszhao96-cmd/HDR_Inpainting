@@ -2,6 +2,26 @@
 
 [中文](#中文) · [English](#english)
 
+### 效果与原理 / Demo & workflow
+
+用于小红书分享的真实样张介绍图与流程图。下方内嵌图片为 SDR 预览；
+流程图中的 gainmap 使用统一对数灰度并增强对比度，仅用于说明。
+
+Real-image cover and workflow illustrations prepared for Xiaohongshu.
+The embedded images are SDR previews; gainmaps in the diagram use a shared
+logarithmic grayscale with enhanced contrast for illustration.
+
+<p align="center">
+  <img src="docs/images/hdr-inpainting-cover.png" width="600" alt="HDR 路人消除前后对比 / Before and after HDR object removal">
+</p>
+
+[下载 Display P3 HDR 介绍图 / Download the Display P3 HDR cover](docs/images/hdr-inpainting-cover-p3-hdr.jpg)
+（下载原文件，用兼容 HDR 的查看器打开 / Download the original file and open it in an HDR-compatible viewer.）
+
+<p align="center">
+  <img src="docs/images/hdr-inpainting-workflow.jpg" width="760" alt="原图、SDR 消除、gainmap 修补与 HDR 合成流程 / Original image, SDR inpainting, gainmap repair and HDR reconstruction">
+</p>
+
 ## 中文
 
 **消除照片里的路人，同时保留 HDR 的高光表现。**
